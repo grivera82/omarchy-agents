@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "grivera.agents",
+  "name": "Agent Sessions",
+  "version": "1.0.0",
+  "author": "grivera",
+  "license": "MIT",
+  "description": "Live Claude Code and Codex sessions: who's working, who's waiting on you, token burn, and a notification when a turn finishes",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Sessions",
+    "description": "Running Claude Code and Codex sessions",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

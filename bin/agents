@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Live Claude Code / Codex sessions CLI (standard-library Python, no setup needed).
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+exec python3 "$ROOT/lib/agents.py" "$@"
