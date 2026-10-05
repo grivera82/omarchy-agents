@@ -56,7 +56,7 @@ There's nothing to configure. It reads files that both CLIs already write:
 | Codex | the thread index in `~/.codex/state_*.sqlite`, plus running `codex` processes | the rollout in `~/.codex/sessions/` (turns, approvals, `token_count`) |
 
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honoured. It needs Python 3 (standard
-library only), `hyprctl` and `notify-send`. Omarchy already includes all three.
+library only) and `hyprctl`. Omarchy already includes both.
 
 > **Caveat:** Claude Code's live state comes from its internal session registry
 > (`~/.claude/sessions/*.json`), which isn't a documented format. A Claude Code
@@ -99,6 +99,10 @@ rescans.
   notification shows the agent's last reply.
 - **Needs you**: a session started waiting on a permission prompt, question or
   dialog. The notification is withdrawn as soon as the session moves on.
+
+Notifications go straight to the notification server over D-Bus, not through
+`notify-send`, so a reply excerpt never appears on a command line where other users
+on the machine could read it.
 
 There's no notification for a session in the window you're focused on. Both kinds
 can be switched off in the panel. Settings live in

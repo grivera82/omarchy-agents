@@ -22,8 +22,9 @@ import glob
 import json
 import os
 import re
-import shutil
+import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -631,48 +632,280 @@ def pick_next(sessions):
 
 
 # ---------------------------------------------------------------- notifications
+#
+# Notifications go straight to the notification server over the session bus.
+# notify-send would put the text (an agent's last reply) on its command line,
+# where any local user can read it from /proc/<pid>/cmdline.
+
+DBUS_ALIGN = {"y": 1, "b": 4, "i": 4, "u": 4, "x": 8, "t": 8, "d": 8,
+              "s": 4, "o": 4, "g": 1, "v": 1, "a": 4, "(": 8, "{": 8}
+DBUS_FIXED = {"y": "B", "b": "I", "i": "i", "u": "I", "x": "q", "t": "Q", "d": "d"}
+
+
+def dbus_types(sig):
+    """Split a signature into its complete types: "sa{sv}i" -> s, a{sv}, i."""
+    out, i = [], 0
+    while i < len(sig):
+        j = i
+        while sig[j] == "a":
+            j += 1
+        if sig[j] in "({":
+            depth = 0
+            while True:
+                depth += sig[j] in "({"
+                depth -= sig[j] in ")}"
+                j += 1
+                if not depth:
+                    break
+        else:
+            j += 1
+        out.append(sig[i:j])
+        i = j
+    return out
+
+
+def dbus_pad(buf, n):
+    buf.extend(b"\0" * (-len(buf) % n))
+
+
+def dbus_write(buf, sig, val):
+    """Append one value of complete type `sig`; variants are (signature, value)."""
+    c = sig[0]
+    if c in DBUS_FIXED:
+        dbus_pad(buf, DBUS_ALIGN[c])
+        buf.extend(struct.pack("<" + DBUS_FIXED[c], val))
+    elif c in "so":
+        raw = val.encode()
+        dbus_pad(buf, 4)
+        buf.extend(struct.pack("<I", len(raw)) + raw + b"\0")
+    elif c == "g":
+        buf.extend(bytes([len(val)]) + val.encode() + b"\0")
+    elif c == "v":
+        dbus_write(buf, "g", val[0])
+        dbus_write(buf, val[0], val[1])
+    elif c == "a":
+        dbus_pad(buf, 4)
+        at = len(buf)
+        buf.extend(b"\0\0\0\0")
+        dbus_pad(buf, DBUS_ALIGN[sig[1]])
+        start = len(buf)
+        for item in (val.items() if sig[1] == "{" else val):
+            dbus_write(buf, sig[1:], item)
+        struct.pack_into("<I", buf, at, len(buf) - start)
+    else:
+        dbus_pad(buf, 8)
+        for t, v in zip(dbus_types(sig[1:-1]), val):
+            dbus_write(buf, t, v)
+
+
+def dbus_read(data, pos, sig, end="<"):
+    """One value of complete type `sig` at `pos` -> (value, new pos)."""
+    c = sig[0]
+    pos += -pos % DBUS_ALIGN[c]
+    if c in DBUS_FIXED:
+        fmt = end + DBUS_FIXED[c]
+        return struct.unpack_from(fmt, data, pos)[0], pos + struct.calcsize(fmt)
+    if c in "so":
+        n = struct.unpack_from(end + "I", data, pos)[0]
+        return data[pos + 4:pos + 4 + n].decode("utf-8", "replace"), pos + 5 + n
+    if c == "g":
+        n = data[pos]
+        return data[pos + 1:pos + 1 + n].decode(), pos + 2 + n
+    if c == "v":
+        inner, pos = dbus_read(data, pos, "g", end)
+        return dbus_read(data, pos, inner, end)
+    if c == "a":
+        n = struct.unpack_from(end + "I", data, pos)[0]
+        pos += 4
+        pos += -pos % DBUS_ALIGN[sig[1]]
+        stop, items = pos + n, []
+        while pos < stop:
+            item, pos = dbus_read(data, pos, sig[1:], end)
+            items.append(item)
+        return (dict(items) if sig[1] == "{" else items), pos
+    vals = []
+    for t in dbus_types(sig[1:-1]):
+        v, pos = dbus_read(data, pos, t, end)
+        vals.append(v)
+    return tuple(vals), pos
+
+
+class SessionBus:
+    """Just enough of the D-Bus wire protocol to call methods and hear signals."""
+
+    def __init__(self, match, on_signal):
+        self.match = match              # AddMatch rule for the signals we want
+        self.on_signal = on_signal      # (interface, member, args)
+        self.sock = None
+        self.serial = 0
+        self.pending = {}               # serial -> [Event, reply args, error name]
+        self.lock = threading.RLock()   # connect() calls Hello while holding it
+
+    def connect(self):
+        addrs = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or \
+            "unix:path=%s/bus" % (os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid())
+        for addr in addrs.split(";"):
+            kind, _, rest = addr.partition(":")
+            opts = dict(kv.split("=", 1) for kv in rest.split(",") if "=" in kv)
+            if kind != "unix" or not ("path" in opts or "abstract" in opts):
+                continue
+            path = opts.get("path") or "\0" + opts["abstract"]
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            try:
+                sock.connect(path)
+                sock.sendall(b"\0AUTH EXTERNAL " + str(os.getuid()).encode().hex().encode() + b"\r\n")
+                reply = b""
+                while not reply.endswith(b"\r\n"):
+                    chunk = sock.recv(256)
+                    if not chunk:
+                        raise OSError("bus closed during auth")
+                    reply += chunk
+                if not reply.startswith(b"OK"):
+                    raise OSError("bus refused auth")
+                sock.sendall(b"BEGIN\r\n")
+            except OSError:
+                sock.close()
+                continue
+            sock.settimeout(None)
+            self.sock = sock
+            threading.Thread(target=self.reader, args=(sock,), daemon=True).start()
+            try:
+                for member, sig, args in (("Hello", "", ()), ("AddMatch", "s", [self.match])):
+                    self.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                              member, sig, args)
+            except OSError:
+                self.drop()
+                raise
+            return
+        raise OSError("no session bus")
+
+    def call(self, dest, path, iface, member, sig="", args=(), reply=True):
+        body = bytearray()
+        for t, v in zip(dbus_types(sig), args):
+            dbus_write(body, t, v)
+        fields = [(1, ("o", path)), (2, ("s", iface)), (3, ("s", member)), (6, ("s", dest))]
+        if sig:
+            fields.append((8, ("g", sig)))
+        with self.lock:
+            if self.sock is None:
+                self.connect()
+            self.serial += 1
+            serial = self.serial
+            msg = bytearray(struct.pack("<cBBBII", b"l", 1, 0 if reply else 1, 1, len(body), serial))
+            dbus_write(msg, "a(yv)", fields)
+            dbus_pad(msg, 8)
+            waiter = self.pending[serial] = [threading.Event(), None, None] if reply else None
+            try:
+                self.sock.sendall(msg + body)
+            except OSError:
+                self.drop()
+                raise
+        if not reply:
+            return None
+        if not waiter[0].wait(5):
+            self.pending.pop(serial, None)
+            raise OSError("%s timed out" % member)
+        if waiter[2]:
+            raise OSError(waiter[2])
+        return waiter[1]
+
+    def drop(self):
+        sock, self.sock = self.sock, None
+        if sock:
+            sock.close()
+        for waiter in self.pending.values():
+            if waiter:
+                waiter[2] = "bus connection lost"
+                waiter[0].set()
+        self.pending.clear()
+
+    def reader(self, sock):
+        buf = b""
+
+        def need(n):
+            nonlocal buf
+            while len(buf) < n:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise OSError("bus closed")
+                buf += chunk
+
+        try:
+            while True:
+                need(16)
+                end = "<" if buf[:1] == b"l" else ">"
+                kind = buf[1]
+                body_len, _, fields_len = struct.unpack_from(end + "III", buf, 4)
+                start = 16 + fields_len + (-fields_len % 8)
+                need(start + body_len)
+                raw, buf = buf[:start + body_len], buf[start + body_len:]
+                fields = dict(dbus_read(raw, 12, "a(yv)", end)[0])
+                args, pos = [], start
+                for t in dbus_types(fields.get(8, "")):
+                    v, pos = dbus_read(raw, pos, t, end)
+                    args.append(v)
+                if kind in (2, 3):          # method return, error
+                    waiter = self.pending.pop(fields.get(5), None)
+                    if waiter:
+                        waiter[1], waiter[2] = args, (fields.get(4) if kind == 3 else None)
+                        waiter[0].set()
+                elif kind == 4:             # signal
+                    self.on_signal(fields.get(2), fields.get(3), args)
+        except (OSError, struct.error, ValueError, IndexError):
+            with self.lock:
+                if self.sock is sock:
+                    self.drop()
+
 
 class Notifier:
+    DEST = "org.freedesktop.Notifications"
+    PATH = "/org/freedesktop/Notifications"
+    URGENCY = {"low": 0, "normal": 1, "critical": 2}
+
     def __init__(self, focus):
         self.focus = focus
+        self.bus = SessionBus("type='signal',interface='%s'" % self.DEST, self.on_signal)
         self.ids = {}             # session id -> notification id, so updates replace
+        self.owners = {}          # notification id -> session id, for clicks
 
     def icon(self, provider):
         path = os.path.join(ASSETS, provider + ".svg")
         return path if os.path.exists(path) else "dialog-information"
 
     def send(self, session, summary, body, urgency="normal"):
-        if not shutil.which("notify-send"):
-            return
         sid = session["id"]
-        args = ["notify-send", "-a", PROVIDERS[session["provider"]], "-i", self.icon(session["provider"]),
-                "-u", urgency, "-p", "-w", "-A", "default=Focus", "-h", "string:x-grivera-agents:" + sid]
-        if sid in self.ids:
-            args += ["-r", str(self.ids[sid])]
-        args += [summary, body]
-
-        def run():
-            try:
-                proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                first = proc.stdout.readline().strip()
-                if first.isdigit():
-                    self.ids[sid] = int(first)
-                action = proc.stdout.read().strip()
-                proc.wait()
-                if action == "default":
-                    self.focus(sid)
-            except OSError:
-                pass
-
-        threading.Thread(target=run, daemon=True).start()
+        hints = {"urgency": ("y", self.URGENCY[urgency]), "x-grivera-agents": ("s", sid)}
+        try:
+            nid = self.bus.call(self.DEST, self.PATH, self.DEST, "Notify", "susssasa{sv}i",
+                                [PROVIDERS[session["provider"]], self.ids.get(sid, 0),
+                                 self.icon(session["provider"]), summary, body,
+                                 ["default", "Focus"], hints, -1])[0]
+        except (OSError, IndexError):
+            return
+        self.ids[sid] = nid
+        self.owners[nid] = sid
 
     def close(self, session_id):
         nid = self.ids.pop(session_id, None)
-        if nid and shutil.which("gdbus"):
-            subprocess.Popen(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
-                              "--object-path", "/org/freedesktop/Notifications",
-                              "--method", "org.freedesktop.Notifications.CloseNotification", str(nid)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if nid:
+            self.owners.pop(nid, None)
+            try:
+                self.bus.call(self.DEST, self.PATH, self.DEST, "CloseNotification", "u", [nid], reply=False)
+            except OSError:
+                pass
+
+    def on_signal(self, iface, member, args):
+        if iface != self.DEST or not args:
+            return
+        if member == "ActionInvoked" and args[1:2] == ["default"]:
+            sid = self.owners.get(args[0])
+            if sid:
+                threading.Thread(target=self.focus, args=(sid,), daemon=True).start()
+        elif member == "NotificationClosed":
+            sid = self.owners.pop(args[0], None)
+            if sid and self.ids.get(sid) == args[0]:
+                del self.ids[sid]
 
 
 def human_duration(seconds):
