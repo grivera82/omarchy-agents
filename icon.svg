@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title"><title id="title">Agent Sessions icon</title><rect x="16" y="16" width="480" height="480" rx="112" fill="#1a1b26"/>
+<rect x="105" y="105" width="317" height="277" rx="39" fill="#7aa2f7"/>
+<rect x="124" y="156" width="279" height="207" rx="20" fill="#24283b"/>
+<circle cx="137" cy="130" r="7" fill="#1a1b26"/><circle cx="160" cy="130" r="7" fill="#1a1b26"/>
+<path d="m298 220 30 26-30 26m47 0h27" fill="none" stroke="#c0caf5" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="70" y="254" width="220" height="160" rx="49" fill="#ff769c"/>
+<path d="M180 254v-37m-110 93H52v45h18m220-45h18v45h-18" fill="none" stroke="#ff769c" stroke-width="17" stroke-linecap="round"/>
+<circle cx="180" cy="208" r="15" fill="#ff769c"/>
+<circle cx="137" cy="322" r="22" fill="#1a1b26"/><circle cx="223" cy="322" r="22" fill="#1a1b26"/>
+<rect x="143" y="369" width="74" height="12" rx="6" fill="#1a1b26"/>
+<circle cx="411" cy="389" r="41" fill="#1a1b26"/><circle cx="411" cy="389" r="24" fill="#6bdaa4"/></svg>

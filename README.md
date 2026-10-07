@@ -1,4 +1,4 @@
-# Agent Sessions (grivera.agents)
+# <img src="icon.svg" width="44" height="44" alt=""> Agent Sessions (grivera.agents)
 
 Omarchy bar widget that shows every Claude Code and Codex session running on this
 machine. You can see which ones are working, which ones are waiting on you (a
