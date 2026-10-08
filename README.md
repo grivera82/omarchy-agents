@@ -125,6 +125,10 @@ local agents = os.getenv("HOME") .. "/.config/omarchy/plugins/grivera.agents/bin
 o.bind("SUPER + ALT + A", "Jump to waiting agent", agents .. " focus next")
 ```
 
+## Status for scripts and voice assistants
+
+`omarchy-shell grivera.agents status` prints a JSON summary: each session's tool, title, project folder, state and what it's waiting for, plus the token burn. It never includes prompts or replies. Voice assistants such as [Jarvis](https://github.com/grivera82/omarchy-jarvis) use it to answer questions. It only reads, and works while the widget is in the bar.
+
 ## How a session finds its window
 
 The plugin walks up from the agent's process to the Hyprland client that owns it.

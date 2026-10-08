@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
+import Quickshell.Io
 import qs.Ui
 import qs.Commons
 
@@ -10,6 +11,40 @@ Panel {
   id: root
   moduleName: "grivera.agents"
   ipcTarget: "grivera.agents"
+  manageIpc: false
+
+  // Panel commands plus status(), which voice assistants (Jarvis) and scripts
+  // read: `omarchy-shell grivera.agents status`.
+  IpcHandler {
+    target: root.ipcTarget
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function status(): string { return JSON.stringify(root.statusSummary()) }
+  }
+
+  function statusTime(ts) { return ts ? Qt.formatDateTime(new Date(ts * 1000), "ddd MMM d, h:mm AP") : "" }
+
+  // Session states only: titles and projects, never prompts or replies.
+  function statusSummary() {
+    if (!svc) return { error: "Agent Sessions isn't running" }
+    var now = Date.now() / 1000
+    function mins(t) { return t ? Math.round((now - t) / 60) : null }
+    return {
+      counts: svc.counts,
+      tokensPerMinute: svc.burn,
+      sessions: svc.sessions.map(function(x) {
+        var o = { tool: x.provider === "codex" ? "Codex" : "Claude Code", title: x.title || "", project: x.cwd || "",
+                  state: x.state, minutesInState: mins(x.since), model: x.model || "" }
+        if (x.waitingFor) o.waitingFor = x.waitingFor
+        if (x.kind && x.kind !== "interactive") o.kind = x.kind
+        return o
+      })
+    }
+  }
+
 
   readonly property var svc: root.bar && root.bar.shell ? root.bar.shell.serviceFor("grivera.agents") : null
   readonly property var sessions: svc ? svc.sessions : []
