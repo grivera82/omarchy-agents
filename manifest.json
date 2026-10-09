@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "grivera.agents",
   "name": "Agent Sessions",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "grivera",
   "license": "MIT",
   "description": "Live Claude Code and Codex sessions: who's working, who's waiting on you, token burn, and a notification when a turn finishes",

@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
     # Off by default: Omarchy's notification server saves each notification by passing
     # its text to bash as an argument, where other local users can read it in /proc.
     "notifyReplies": False,   # put the agent's last reply in "finished" notifications
+    "notifyDetails": False,   # session title (often the first prompt), folder and wait reason
     "minTurnSeconds": 20,
 }
 
@@ -929,16 +930,19 @@ def check_transitions(prev, sessions, config, notifier):
             continue
         if before["state"] == "waiting":
             notifier.close(sid)
+        # Titles come from prompts, so by default notifications name only the agent.
+        details = config.get("notifyDetails")
+        who = s["title"] if details else PROVIDERS[s["provider"]]
         if s["state"] == "waiting" and config.get("notifyWaiting"):
             if not is_focused(s):
-                why = (s.get("waitingFor") or "input needed")
-                notifier.send(s, "%s needs you" % s["title"], why[:1].upper() + why[1:] + " · " + s["cwd"])
+                why = (s.get("waitingFor") or "input needed") if details else "waiting for you"
+                notifier.send(s, "%s needs you" % who, why[:1].upper() + why[1:] + (" · " + s["cwd"] if details else ""))
         elif s["state"] == "idle" and before["state"] == "working" and config.get("notifyFinished"):
             took = now - (s.get("turnStart") or before["since"])
             if took >= config.get("minTurnSeconds", 20) and not is_focused(s):
                 reply = s.get("lastText") if config.get("notifyReplies") else None
-                notifier.send(s, "%s finished" % s["title"],
-                              (reply or "Turn complete") + "\n" + human_duration(took) + " · " + s["cwd"])
+                notifier.send(s, "%s finished" % who,
+                              (reply or "Turn complete") + "\n" + human_duration(took) + (" · " + s["cwd"] if details else ""))
     for sid in prev:
         if sid not in current:
             notifier.close(sid)

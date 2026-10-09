@@ -350,6 +350,17 @@ Panel {
 
             Toggle {
               width: parent.width
+              visible: root.config.notifyFinished !== false || root.config.notifyWaiting !== false
+              label: "Name the session in notifications"
+              description: "Adds the session title (often your first prompt) and folder. Off by default for the same reason."
+              foreground: root.fg
+              fontFamily: root.fontFamily
+              checked: root.config.notifyDetails === true
+              onClicked: root.setConfig("notifyDetails", !checked)
+            }
+
+            Toggle {
+              width: parent.width
               label: "Notify when an agent needs you"
               description: "Permission prompts, questions and dialogs."
               foreground: root.fg
