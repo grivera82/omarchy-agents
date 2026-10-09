@@ -96,13 +96,16 @@ rescans.
 ## Notifications
 
 - **Finished**: a turn that ran at least `minTurnSeconds` (default 20) went idle. The
-  notification shows the agent's last reply.
+  notification says how long it took and where. Turn on "Show the reply in
+  notifications" to include the start of the agent's last reply.
 - **Needs you**: a session started waiting on a permission prompt, question or
   dialog. The notification is withdrawn as soon as the session moves on.
 
 Notifications go straight to the notification server over D-Bus, not through
-`notify-send`, so a reply excerpt never appears on a command line where other users
-on the machine could read it.
+`notify-send`, so nothing the plugin sends appears on its own command line. Replies
+are still left out by default: Omarchy's notification server (as of 4.0.4) saves each
+notification by passing its text to `bash` as an argument, and other users on the
+machine can read process arguments in `/proc`.
 
 There's no notification for a session in the window you're focused on. Both kinds
 can be switched off in the panel. Settings live in

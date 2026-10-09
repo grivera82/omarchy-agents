@@ -40,6 +40,9 @@ ASSETS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = {
     "notifyFinished": True,   # a turn that ran at least minTurnSeconds ended
     "notifyWaiting": True,    # a session stopped to ask you something
+    # Off by default: Omarchy's notification server saves each notification by passing
+    # its text to bash as an argument, where other local users can read it in /proc.
+    "notifyReplies": False,   # put the agent's last reply in "finished" notifications
     "minTurnSeconds": 20,
 }
 
@@ -933,8 +936,9 @@ def check_transitions(prev, sessions, config, notifier):
         elif s["state"] == "idle" and before["state"] == "working" and config.get("notifyFinished"):
             took = now - (s.get("turnStart") or before["since"])
             if took >= config.get("minTurnSeconds", 20) and not is_focused(s):
+                reply = s.get("lastText") if config.get("notifyReplies") else None
                 notifier.send(s, "%s finished" % s["title"],
-                              (s.get("lastText") or "Turn complete") + "\n" + human_duration(took) + " · " + s["cwd"])
+                              (reply or "Turn complete") + "\n" + human_duration(took) + " · " + s["cwd"])
     for sid in prev:
         if sid not in current:
             notifier.close(sid)

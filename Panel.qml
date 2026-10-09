@@ -339,6 +339,17 @@ Panel {
 
             Toggle {
               width: parent.width
+              visible: root.config.notifyFinished !== false
+              label: "Show the reply in notifications"
+              description: "Off by default: Omarchy saves notifications in a way other users on this computer can read."
+              foreground: root.fg
+              fontFamily: root.fontFamily
+              checked: root.config.notifyReplies === true
+              onClicked: root.setConfig("notifyReplies", !checked)
+            }
+
+            Toggle {
+              width: parent.width
               label: "Notify when an agent needs you"
               description: "Permission prompts, questions and dialogs."
               foreground: root.fg
