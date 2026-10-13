@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Claude Code and Codex sessions for the grivera.agents Omarchy plugin.
+"""Live Claude Code, Codex, OpenCode and Grok sessions for the grivera.agents Omarchy plugin.
 
 Reads what the CLIs already keep on disk, so nothing has to be configured:
 
@@ -7,6 +7,9 @@ Reads what the CLIs already keep on disk, so nothing has to be configured:
                ~/.claude/projects/*/<id>.jsonl transcript (title, token usage)
   Codex        ~/.codex/state_*.sqlite          thread index
                ~/.codex/sessions/**/rollout-*   rollout (turns, approvals, tokens)
+  OpenCode     ~/.local/share/opencode/opencode.db  sessions and messages (2.x)
+  Grok         ~/.grok/active_sessions.json     open sessions (pid, folder)
+               ~/.grok/sessions/*/<id>/         events, updates, summary, usage
 
 Standard library only.
 
@@ -14,6 +17,7 @@ Standard library only.
   agents daemon                JSON state lines on stdout, commands on stdin
   agents focus [ID|next]       focus a session's terminal window; `next` picks
                                the one waiting longest, else the latest finished
+  agents usage [--json]        plan limits and API-equivalent spend (see usage.py)
 """
 
 import collections
@@ -30,9 +34,14 @@ import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True   # a __pycache__ in the plugin folder makes the shell reload it
+import usage                     # noqa: E402
+
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 CODEX_DIR = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+OPENCODE_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "opencode")
+GROK_DIR = os.environ.get("GROK_HOME") or os.path.join(HOME, ".grok")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "grivera-agents")
 CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
 ASSETS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
@@ -49,12 +58,14 @@ DEFAULT_CONFIG = {
 
 POLL_BUSY = 1.0
 POLL_IDLE = 2.5
+USAGE_EVERY = 120             # seconds between spend rescans while nobody's looking
 BURN_WINDOW = 300             # seconds of history behind "tokens per minute"
 CODEX_RECENT = 12 * 3600      # threads touched this recently are candidates
 CODEX_LINGER = 10 * 60        # a Codex thread with no process stays listed this long
+OPENCODE_STALE = 30 * 60      # an OpenCode turn this quiet was cut off (or predates 2.x)
 SUBAGENT_RESCAN = 10
 
-PROVIDERS = {"claude": "Claude Code", "codex": "Codex"}
+PROVIDERS = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode", "grok": "Grok"}
 CLAUDE_STATES = {"busy": "working", "idle": "idle", "waiting": "waiting"}
 CODEX_WAIT_EVENTS = {
     "exec_approval_request": "approve command",
@@ -342,6 +353,31 @@ class ClaudeSession:
         }
 
 
+_ignore_cache = {}
+
+
+def ignored_dir(cwd, now):
+    """True when cwd, or a folder above it, has an .agents-ignore file. Tools
+    that run headless agents (scripts, voice assistants) drop one in their
+    working directory so their short-lived sessions stay out of the list."""
+    if not cwd:
+        return False
+    hit = _ignore_cache.get(cwd)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    d, found = os.path.abspath(cwd), False
+    while True:
+        if os.path.exists(os.path.join(d, ".agents-ignore")):
+            found = True
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    _ignore_cache[cwd] = (now, found)
+    return found
+
+
 def claude_registry():
     out = {}
     for path in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
@@ -518,6 +554,338 @@ def codex_processes():
     return procs
 
 
+# ---------------------------------------------------------------- OpenCode
+#
+# OpenCode 2.x runs one background server (`opencode serve --service`) that owns
+# every session and projects its events into a sqlite database. Terminal UIs
+# are clients of that server, so a session isn't tied to a process: the TUI
+# open in the session's folder stands in for it.
+
+class OpencodeSession:
+    def __init__(self, row):
+        self.id = row["id"]
+        self.row = row
+        self.cursor = 0           # newest message time_updated read so far, in ms
+        self.usage = {}           # message id -> fresh tokens, for the burn rate
+        self.tokens = [0, 0, 0, 0]
+        self.burn = Burn()
+        self.context = 0
+        self.model = None
+        self.last_prompt = None
+        self.last_text = None
+        self.prompt_seq = self.text_seq = self.idle_seq = -1
+        self.turn_start = None
+        self.idle_at = None
+        self.pid = None
+
+    @property
+    def cwd(self):
+        return self.row.get("directory")
+
+    def update(self, con):
+        # Assistant messages are rewritten while they stream, so read by update
+        # time (re-reading the newest ones) rather than by sequence number.
+        rows = con.execute(
+            "select id, session_id, type, seq, time_created, time_updated, data from session_message"
+            " where session_id in (select id from session_v2 where id = ? or parent_id = ?)"
+            " and time_updated >= ? order by seq", (self.id, self.id, self.cursor)).fetchall()
+        for mid, sid, typ, seq, created, updated, data in rows:
+            self.cursor = max(self.cursor, updated)
+            try:
+                o = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(o, dict):
+                self.feed(mid, sid == self.id, typ, seq, created / 1000.0, updated / 1000.0, o)
+        if rows:
+            # The server's own running totals, subagent sessions included.
+            self.tokens = [n or 0 for n in con.execute(
+                "select sum(tokens_input), sum(tokens_output + tokens_reasoning), sum(tokens_cache_read),"
+                " sum(tokens_cache_write) from session_v2 where id = ? or parent_id = ?",
+                (self.id, self.id)).fetchone()]
+
+    def feed(self, mid, main, typ, seq, created, updated, o):
+        if typ == "assistant":
+            tok = o.get("tokens") or {}
+            cache = tok.get("cache") or {}
+            fresh = ((tok.get("input") or 0) + (tok.get("output") or 0) + (tok.get("reasoning") or 0)
+                     + (cache.get("write") or 0))
+            self.burn.add(updated, fresh - self.usage.get(mid, 0))
+            self.usage[mid] = max(fresh, self.usage.get(mid, 0))
+            if not main:
+                return
+            if tok:
+                self.context = (tok.get("input") or 0) + (cache.get("read") or 0) + (cache.get("write") or 0)
+            self.model = (o.get("model") or {}).get("id") or self.model
+            text = " ".join(b.get("text", "") for b in o.get("content") or []
+                            if isinstance(b, dict) and b.get("type") == "text").strip()
+            if text and seq >= self.text_seq:
+                self.text_seq, self.last_text = seq, text
+        elif not main:
+            return
+        elif typ == "user" and seq > self.prompt_seq:
+            self.prompt_seq, self.turn_start = seq, created
+            self.last_prompt = o.get("text") or self.last_prompt
+        elif typ == "idle" and seq > self.idle_seq:
+            self.idle_seq, self.idle_at = seq, created
+
+    def busy(self, now, server):
+        # A turn runs from the user message to the next idle marker. There's no
+        # marker when the server stops mid-turn, or for turns from OpenCode 1.x.
+        return bool(server and self.prompt_seq > self.idle_seq and now - self.cursor / 1000.0 < OPENCODE_STALE)
+
+    def snapshot(self, now, server):
+        busy = self.busy(now, server)
+        row = self.row
+        try:
+            model = json.loads(row.get("model") or "null") or {}
+        except ValueError:
+            model = {}
+        title = row.get("title") or one_line(self.last_prompt, 60) or os.path.basename(self.cwd or "") or "OpenCode"
+        return {
+            "id": "opencode:" + self.id,
+            "provider": "opencode",
+            "pid": self.pid,
+            "sessionId": self.id,
+            "title": one_line(title, 80),
+            "titleMatch": None,
+            "cwd": short_path(self.cwd),
+            "kind": "",
+            "state": "working" if busy else "idle",
+            "waitingFor": None,
+            "since": (self.turn_start if busy else self.idle_at) or (row.get("time_updated") or 0) / 1000.0 or now,
+            "startedAt": (row.get("time_created") or 0) / 1000.0,
+            "turnStart": self.turn_start,
+            "model": self.model or (model.get("id") if isinstance(model, dict) else None),
+            "tokens": {"input": self.tokens[0], "output": self.tokens[1], "cacheRead": self.tokens[2],
+                       "cacheWrite": self.tokens[3], "fresh": self.tokens[0] + self.tokens[1] + self.tokens[3]},
+            "context": self.context,
+            "contextWindow": None,
+            "burn": round_rate(self.burn.rate(now)),
+            "lastPrompt": one_line(self.last_prompt, 140),
+            "lastText": one_line(self.last_text, 240),
+        }
+
+
+def opencode_connect():
+    path = os.path.join(OPENCODE_DIR, "opencode.db")
+    if not os.path.exists(path):
+        return None
+    con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def opencode_rows(con, now):
+    """Recent top-level sessions, newest activity first. OpenCode 1.x keeps an
+    older schema with no session_v2 table; those installs simply list nothing."""
+    try:
+        return [dict(r) for r in con.execute(
+            "select *, max(time_updated, coalesce(time_idle, 0)) as active from session_v2"
+            " where parent_id is null and time_archived is null"
+            " and max(time_updated, coalesce(time_idle, 0)) > ? order by active desc limit 30",
+            (int((now - CODEX_RECENT) * 1000),))]
+    except sqlite3.OperationalError:
+        return []
+
+
+def opencode_processes():
+    """(server running, {pid: (folder, session id or None)}) for OpenCode TUIs
+    and `opencode run`, leaving out the shared server."""
+    server, procs = False, {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open("/proc/%d/comm" % pid) as f:
+                if f.read().strip() != "opencode":
+                    continue
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                args = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+            cwd = os.readlink("/proc/%d/cwd" % pid)
+        except OSError:
+            continue
+        server = True
+        if any(a in ("serve", "web", "acp", "--version", "-v", "upgrade") for a in args[1:2]):
+            continue
+        session, folder = None, cwd
+        for i, a in enumerate(args[1:], 1):
+            if a in ("-s", "--session") and i + 1 < len(args):
+                session = args[i + 1]
+            elif a.startswith("--session="):
+                session = a.split("=", 1)[1]
+            elif not a.startswith("-") and args[i - 1] not in ("-s", "--session", "-m", "--model", "--agent",
+                                                                "-p", "--prompt", "--port", "--hostname"):
+                path = os.path.join(cwd, os.path.expanduser(a))
+                if os.path.isdir(path):
+                    folder = os.path.normpath(path)
+        procs[pid] = (folder, session)
+    return server, procs
+
+
+# ---------------------------------------------------------------- Grok Build
+#
+# Grok lists its open sessions (pid, folder) in ~/.grok/active_sessions.json.
+# Each session folder has events.jsonl (turn_started / turn_ended /
+# permission_requested ...), updates.jsonl (the ACP stream: prompts and
+# replies), summary.json (title, model) and usage.json (token totals).
+
+class GrokSession:
+    def __init__(self, sid, folder):
+        self.id = sid
+        self.dir = folder
+        self.events = Tail(os.path.join(folder, "events.jsonl"))
+        self.updates = Tail(os.path.join(folder, "updates.jsonl"))
+        self.mtimes = {}
+        self.summary = {}
+        self.tokens = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "fresh": 0}
+        self.burn = Burn()
+        self.context = 0
+        self.window = None
+        self.pid = None
+        self.cwd = None
+        self.opened = None
+        self.clear()
+
+    def clear(self):
+        self.busy = False
+        self.waiting = None
+        self.turn_start = None
+        self.ended_at = None
+        self.model = None
+        self.active = 0
+        self.last_prompt = None
+        self.last_text = None
+        self.chunk = None         # which kind of message chunk came last
+
+    def changed(self, name):
+        try:
+            mtime = os.path.getmtime(os.path.join(self.dir, name))
+        except OSError:
+            return False
+        if self.mtimes.get(name) == mtime:
+            return False
+        self.mtimes[name] = mtime
+        return True
+
+    def update(self):
+        events, reset = self.events.read()
+        if reset:
+            self.clear()
+        for o in events:
+            if isinstance(o, dict):
+                self.feed_event(o)
+        updates, _ = self.updates.read()
+        for o in updates:
+            u = ((o.get("params") or {}).get("update") or {}) if isinstance(o, dict) else {}
+            if isinstance(u, dict):
+                self.feed_update(u)
+        if self.changed("summary.json"):
+            self.summary = load_json(os.path.join(self.dir, "summary.json"), {}) or {}
+        if self.changed("signals.json"):
+            sig = load_json(os.path.join(self.dir, "signals.json"), {}) or {}
+            self.window = sig.get("contextWindowTokens") or self.window
+        if self.changed("usage.json"):
+            self.read_usage()
+
+    def feed_event(self, o):
+        t = o.get("type")
+        ts = parse_ts(o.get("ts")) or time.time()
+        self.active = max(self.active, ts)
+        if t == "turn_started":
+            self.busy, self.turn_start, self.waiting = True, ts, None
+            self.model = o.get("model_id") or self.model
+        elif t == "turn_ended":
+            self.busy, self.ended_at, self.waiting = False, ts, None
+        elif t == "permission_requested":
+            self.waiting = "permission prompt"
+        elif t == "permission_resolved":
+            self.waiting = None
+        elif t == "phase_changed":
+            self.waiting = "permission prompt" if o.get("phase") == "permission_prompt" else None
+
+    def feed_update(self, u):
+        kind = u.get("sessionUpdate")
+        c = u.get("content") if isinstance(u.get("content"), dict) else {}
+        text = c.get("text") if c.get("type") == "text" else None
+        if kind == "user_message_chunk" and text is not None:
+            self.last_prompt = (self.last_prompt or "") + text if self.chunk == kind else text
+        elif kind == "agent_message_chunk" and text is not None:
+            self.last_text = (self.last_text or "") + text if self.chunk == kind else text
+        elif kind in ("agent_thought_chunk", "tool_call", "tool_call_update", "turn_completed"):
+            pass
+        else:
+            return
+        self.chunk = kind
+
+    def read_usage(self):
+        data = load_json(os.path.join(self.dir, "usage.json"), {}) or {}
+        tot = data.get("session") if isinstance(data.get("session"), dict) else {}
+        tok = usage.grok_tokens(tot)
+        fresh = tok[0] + tok[1] + tok[3]
+        # Grok writes usage at the end of each turn, so the burn arrives in steps.
+        self.burn.add(self.mtimes.get("usage.json") or time.time(), fresh - self.tokens["fresh"])
+        self.tokens = {"input": tok[0], "output": tok[1], "cacheRead": tok[2], "cacheWrite": tok[3], "fresh": fresh}
+        turns = [t for t in data.get("turns") or [] if isinstance(t, dict)]
+        if turns:
+            last = turns[-1]
+            calls = last.get("modelCalls") or 1
+            self.context = int((last.get("inputTokens") or 0) / max(1, calls))
+            self.model = self.model or last.get("primaryModelId")
+
+    def snapshot(self, now):
+        busy = self.busy and self.pid is not None
+        state = "waiting" if busy and self.waiting else "working" if busy else "idle"
+        sm = self.summary
+        title = (sm.get("generated_title") or sm.get("session_summary") or one_line(self.last_prompt, 60)
+                 or os.path.basename(self.cwd or "") or "Grok")
+        return {
+            "id": "grok:" + self.id,
+            "provider": "grok",
+            "pid": self.pid,
+            "sessionId": self.id,
+            "title": one_line(title, 80),
+            "titleMatch": None,
+            "cwd": short_path(self.cwd),
+            "kind": "",
+            "state": state,
+            "waitingFor": self.waiting if state == "waiting" else None,
+            "since": (self.turn_start if busy else self.ended_at) or self.opened or self.active or now,
+            "startedAt": parse_ts(sm.get("created_at")) or self.opened or 0,
+            "turnStart": self.turn_start,
+            "model": sm.get("current_model_id") or self.model,
+            "tokens": self.tokens,
+            "context": self.context,
+            "contextWindow": self.window,
+            "burn": round_rate(self.burn.rate(now)),
+            "lastPrompt": one_line(self.last_prompt, 140),
+            "lastText": one_line(self.last_text, 240),
+        }
+
+
+def grok_active():
+    """{session id: (pid, folder, opened at)} for Grok sessions whose process
+    still runs (the pid's start time must match, so a reused pid doesn't count)."""
+    rows = load_json(os.path.join(GROK_DIR, "active_sessions.json"), [])
+    out = {}
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or not r.get("session_id") or not isinstance(r.get("pid"), int):
+            continue
+        st = proc_stat(r["pid"])
+        if not st or (r.get("pid_start") is not None and str(r["pid_start"]) != st[1]):
+            continue
+        out[r["session_id"]] = (r["pid"], r.get("cwd"), parse_ts(r.get("opened_at")))
+    return out
+
+
+def grok_folder(sid):
+    # Folders are grouped by URL-encoded working directory (or a slug + hash
+    # for long paths), so look the session up by id.
+    hits = glob.glob(os.path.join(glob.escape(GROK_DIR), "sessions", "*", glob.escape(sid)))
+    return hits[0] if hits else None
+
+
 # ---------------------------------------------------------------- windows
 
 def hypr_json(*args):
@@ -532,6 +900,21 @@ def strip_spinner(title):
     return re.sub(r"^[^\w(\[]+", "", title or "").strip()
 
 
+def title_matches(win_title, want):
+    """2 if a window title is the session's title, 1 if it's a cut-off start of
+    it (Grok titles its window "<first 40 characters>… - grok"), else 0."""
+    t = strip_spinner(win_title)
+    if not want or not t:
+        return 0
+    if t == want:
+        return 2
+    t = re.sub(r"\s+-\s+grok$", "", t)
+    if t == want:
+        return 2
+    head = t[:-1].rstrip() if t.endswith("…") else ""
+    return 1 if len(head) >= 8 and want.startswith(head) else 0
+
+
 def find_window(session, clients=None):
     """The Hyprland client hosting a session: the window whose process is an
     ancestor of the agent. One terminal process can own many windows (Ghostty),
@@ -544,9 +927,9 @@ def find_window(session, clients=None):
     if not cands:
         return None, False
     want = session.get("titleMatch") or session.get("title")
-    for c in cands:
-        if want and strip_spinner(c.get("title")) == want:
-            return c, True
+    best = max(cands, key=lambda c: title_matches(c.get("title"), want))
+    if title_matches(best.get("title"), want):
+        return best, True
     if len(cands) == 1:
         return cands[0], True
     cands.sort(key=lambda c: c.get("focusHistoryID", 99))
@@ -583,6 +966,8 @@ class Tracker:
     def __init__(self):
         self.claude = {}
         self.codex = {}
+        self.opencode = {}
+        self.grok = {}
 
     def scan(self):
         now = time.time()
@@ -614,10 +999,68 @@ class Tracker:
                 live[row["id"]] = th
         self.codex = live
 
-        sessions = [s.snapshot(now) for s in self.claude.values()] + [t.snapshot(now) for t in self.codex.values()]
+        server = self.scan_opencode(now)
+        self.scan_grok(now)
+
+        sessions = [s.snapshot(now) for s in self.claude.values() if not ignored_dir(s.reg.get("cwd"), now)] \
+            + [t.snapshot(now) for t in self.codex.values() if not ignored_dir(t.cwd, now)] \
+            + [o.snapshot(now, server) for o in self.opencode.values() if not ignored_dir(o.cwd, now)] \
+            + [g.snapshot(now) for g in self.grok.values() if not ignored_dir(g.cwd, now)]
         order = {"waiting": 0, "working": 1, "idle": 2}
         sessions.sort(key=lambda s: (order[s["state"]], s["since"] if s["state"] != "idle" else -s["since"]))
         return sessions
+
+    def scan_grok(self, now):
+        """Open Grok sessions, plus closed ones for CODEX_LINGER after their
+        last activity."""
+        active = grok_active()
+        live = {}
+        for sid, (pid, cwd, opened) in active.items():
+            ses = self.grok.get(sid)
+            if ses is None:
+                folder = grok_folder(sid)
+                if not folder:
+                    continue
+                ses = GrokSession(sid, folder)
+            ses.pid, ses.cwd, ses.opened = pid, cwd or ses.cwd, opened
+            live[sid] = ses
+        for sid, ses in self.grok.items():
+            if sid not in live and now - max(ses.active, ses.mtimes.get("usage.json") or 0) < CODEX_LINGER:
+                ses.pid = None
+                live[sid] = ses
+        for ses in live.values():
+            ses.update()
+            ses.cwd = ses.cwd or (ses.summary.get("info") or {}).get("cwd")
+        self.grok = live
+
+    def scan_opencode(self, now):
+        """Refresh OpenCode sessions; True while an OpenCode process runs."""
+        server, procs = opencode_processes()
+        con = opencode_connect()
+        if con is None:
+            self.opencode = {}
+            return server
+        try:
+            rows = opencode_rows(con, now)
+            live = {}
+            claimed = set()
+            for row in rows:      # newest first
+                ses = self.opencode.get(row["id"]) or OpencodeSession(row)
+                ses.row = row
+                ses.update(con)
+                pid = next((p for p, (_, sid) in procs.items() if sid == row["id"]), None)
+                if pid is None:
+                    pid = next((p for p, (folder, sid) in procs.items()
+                                if folder == ses.cwd and not sid and p not in claimed), None)
+                ses.pid = pid
+                if pid:
+                    claimed.add(pid)
+                if pid or ses.busy(now, server) or now - row["active"] / 1000.0 < CODEX_LINGER:
+                    live[row["id"]] = ses
+            self.opencode = live
+        finally:
+            con.close()
+        return server
 
 
 def summarize(sessions):
@@ -999,6 +1442,28 @@ def daemon():
 
     threading.Thread(target=poller, daemon=True).start()
 
+    usage_wake = threading.Event()
+    usage_ask = {"limits": False}
+
+    def usage_poller():
+        ledger = usage.Ledger()
+        last = None
+        while True:
+            limits, usage_ask["limits"] = usage_ask["limits"], False
+            try:
+                rep = ledger.report(refresh_limits=limits)
+            except Exception as exc:  # a format change shouldn't take the daemon down
+                emit({"type": "log", "error": "usage failed: %s" % exc})
+            else:
+                blob = json.dumps(dict(rep, at=0), sort_keys=True)
+                if blob != last:
+                    last = blob
+                    emit({"type": "usage", "usage": rep})
+            usage_wake.wait(USAGE_EVERY)
+            usage_wake.clear()
+
+    threading.Thread(target=usage_poller, daemon=True).start()
+
     for line in sys.stdin:
         try:
             msg = json.loads(line)
@@ -1007,6 +1472,10 @@ def daemon():
         cmd, ok, err = msg.get("cmd"), True, None
         if cmd == "refresh":
             wake.set()
+        elif cmd == "usage":
+            # The Usage tab is open: rescan now, and refresh stale plan limits.
+            usage_ask["limits"] = True
+            usage_wake.set()
         elif cmd == "focus":
             ok = focus(msg.get("session") or "next")
             err = None if ok else "no window found for that session"
@@ -1037,7 +1506,7 @@ def fmt_tokens(n):
 
 def print_status(sessions):
     if not sessions:
-        print("No Claude Code or Codex sessions running.")
+        print("No Claude Code, Codex, OpenCode or Grok sessions running.")
         return
     now = time.time()
     for s in sessions:
@@ -1058,6 +1527,12 @@ def main(argv):
             print(json.dumps({"sessions": sessions, "counts": summarize(sessions)}, indent=2))
         else:
             print_status(sessions)
+    elif cmd == "usage":
+        rep = usage.Ledger().report()
+        if "--json" in argv:
+            print(json.dumps(rep, indent=2))
+        else:
+            usage.print_report(rep)
     elif cmd == "focus":
         sessions = Tracker().scan()
         target = argv[2] if len(argv) > 2 else "next"

@@ -2,8 +2,9 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Owns the single `agents daemon` process, which watches Claude Code and Codex
-// session files, and mirrors its state. Bar widgets on every monitor share it.
+// Owns the single `agents daemon` process, which watches Claude Code, Codex
+// and OpenCode session files, and mirrors its state. Bar widgets on every
+// monitor share it.
 Item {
   id: root
 
@@ -21,6 +22,8 @@ Item {
   readonly property var counts: state.counts || ({ waiting: 0, working: 0, idle: 0 })
   readonly property int burn: state.burn || 0
   readonly property var config: state.config || ({})
+  // Plan limits and API-equivalent spend per tool (lib/usage.py).
+  property var usage: ({ providers: [] })
 
   function send(cmd, args) {
     if (!daemon.running) return false
@@ -28,13 +31,16 @@ Item {
     return true
   }
 
-  function focus(sessionId) { return send("focus", { session: sessionId || "next" }) }
+  // Not "focus": that would shadow Item.focus, and calls would hit the property.
+  function focusSession(sessionId) { return send("focus", { session: sessionId || "next" }) }
 
   function handleLine(line) {
     var msg
     try { msg = JSON.parse(line) } catch (e) { return }
     if (msg.type === "state") {
       root.state = msg.state || {}
+    } else if (msg.type === "usage") {
+      root.usage = msg.usage || { providers: [] }
     } else if (msg.type === "result" && !msg.ok) {
       root.lastError = msg.error || "command failed"
       clearError.restart()
