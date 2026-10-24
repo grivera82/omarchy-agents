@@ -1,5 +1,9 @@
 # <img src="icon.svg" width="44" height="44" alt=""> Agent Sessions (grivera.agents)
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Omarchy plugin marketplace](https://img.shields.io/badge/Omarchy-plugin%20marketplace-2f6f4f.svg)](https://plugins.omarchy.org/plugin.html?id=grivera.agents)
+
+> Part of the [Omarchy plugin marketplace](https://plugins.omarchy.org/plugin.html?id=grivera.agents), listed as **Agent Sessions** (plugin ID `grivera.agents`). The marketplace registry lives at [omacom/omarchy-plugin-marketplace](https://github.com/omacom/omarchy-plugin-marketplace).
+
 Omarchy bar widget that shows every Claude Code, Codex, OpenCode and Grok session running
 on this machine. You can see which ones are working, which ones are waiting on you (a
 permission prompt, a question, a dialog), and how fast each is burning tokens. It
@@ -21,6 +25,15 @@ context fill, and it focuses the exact terminal window for each session.
 
 **Privacy:** it reads only local files, makes no network requests of its own, and nothing
 leaves your machine.
+
+## Requirements
+
+- Omarchy 4 and its Quickshell-based shell
+- Python 3 (standard library only) and `hyprctl`. Omarchy includes both.
+- At least one of Claude Code, Codex, OpenCode 2.x or Grok Build. Nothing needs
+  to be configured in them.
+- For the plan limits on the Usage tab: Omarchy's `omarchy-agent-usage-update`
+  collectors, which ship with Omarchy.
 
 ## Install
 
@@ -71,6 +84,18 @@ library only) and `hyprctl`. Omarchy already includes both.
 > OpenCode's database. OpenCode support needs OpenCode 2.x; 1.x keeps an older
 > schema and its sessions aren't listed. Grok Build's session files are internal
 > as well (tested with Grok 1.0.52).
+
+### Manual install
+
+To install without the plugin manager, clone the repository into Omarchy's
+plugin folder, check it with Omarchy's validator, then rescan and enable it:
+
+```
+git clone https://github.com/grivera82/omarchy-agents.git ~/.config/omarchy/plugins/grivera.agents
+omarchy plugin validate ~/.config/omarchy/plugins/grivera.agents
+omarchy-shell shell rescanPlugins
+omarchy plugin enable grivera.agents --section right
+```
 
 ## Bar widget
 
@@ -214,7 +239,7 @@ folder, or anywhere below it, are skipped, and send no notifications.
 
 ## License
 
-MIT. The Claude and Codex marks in `assets/` come from Omarchy's `omarchy.agents`
+[MIT](LICENSE). The Claude and Codex marks in `assets/` come from Omarchy's `omarchy.agents`
 plugin (MIT) and belong to their owners. The OpenCode mark is a simplified
 rendering of OpenCode's logo, which belongs to its owners. The Grok mark comes from
 [lobehub/lobe-icons](https://github.com/lobehub/lobe-icons) (MIT) and belongs to xAI.
